@@ -1,0 +1,483 @@
+"""
+model.py
+
+Implementation of the Metabolic Causal Planner for cancer immunotherapy
+response prediction from pre-treatment bulk RNA-seq profiles.
+
+The framework contains four main components:
+
+1. CounterfactualMetabolicAdjuster
+2. AgentDrivenImmuneResponseMapper
+3. UncertaintyGuidedResponsePredictor
+4. MetabolicCausalPlanner
+
+Author: Xuan Fang
+"""
+
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MLPBlock(nn.Module):
+    """
+    A reusable MLP block with Linear, LayerNorm, ReLU, and Dropout.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        dropout: float = 0.3,
+        use_layer_norm: bool = True,
+    ) -> None:
+        super().__init__()
+
+        layers = [nn.Linear(input_dim, output_dim)]
+
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(output_dim))
+
+        layers.append(nn.ReLU())
+        layers.append(nn.Dropout(dropout))
+
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class CounterfactualMetabolicAdjuster(nn.Module):
+    """
+    Counterfactual Metabolic Adjuster.
+
+    This module encodes the input bulk RNA-seq vector into a latent biological
+    state and estimates a response-relevant latent perturbation.
+
+    Input:
+        x: Gene expression vector of shape [batch_size, input_dim]
+
+    Output:
+        z: Original latent biological state
+        delta_z: Estimated counterfactual adjustment
+        adjusted_z: Adjusted latent biological state
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int = 128,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+    ) -> None:
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            MLPBlock(input_dim, hidden_dim, dropout=dropout),
+            MLPBlock(hidden_dim, latent_dim, dropout=dropout),
+        )
+
+        self.perturbation_network = nn.Sequential(
+            MLPBlock(latent_dim, hidden_dim, dropout=dropout),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z = self.encoder(x)
+        delta_z = self.perturbation_network(z)
+        adjusted_z = z + delta_z
+
+        return z, delta_z, adjusted_z
+
+
+class AgentDrivenImmuneResponseMapper(nn.Module):
+    """
+    Agent-driven Immune Response Mapper.
+
+    This module maps the adjusted latent biological state into a compact
+    immune-response embedding.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 128,
+        embedding_dim: int = 64,
+        hidden_dims: Tuple[int, int] = (256, 128),
+        dropout: float = 0.3,
+    ) -> None:
+        super().__init__()
+
+        hidden_dim_1, hidden_dim_2 = hidden_dims
+
+        self.mapper = nn.Sequential(
+            MLPBlock(latent_dim, hidden_dim_1, dropout=dropout),
+            MLPBlock(hidden_dim_1, hidden_dim_2, dropout=dropout),
+            MLPBlock(hidden_dim_2, embedding_dim, dropout=dropout),
+        )
+
+    def forward(self, adjusted_z: torch.Tensor) -> torch.Tensor:
+        immune_embedding = self.mapper(adjusted_z)
+        return immune_embedding
+
+
+class UncertaintyGuidedResponsePredictor(nn.Module):
+    """
+    Uncertainty-guided Response Predictor.
+
+    This module predicts the patient-level responder probability. During
+    stochastic inference, dropout remains active to approximate Monte Carlo
+    uncertainty estimation.
+
+    Output:
+        mean_probability: Mean responder probability
+        uncertainty: Variance across stochastic predictions
+        probabilities: All stochastic probabilities
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int = 64,
+        hidden_dim: int = 64,
+        dropout: float = 0.3,
+    ) -> None:
+        super().__init__()
+
+        self.response_head = nn.Sequential(
+            MLPBlock(embedding_dim, hidden_dim, dropout=dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward_once(self, immune_embedding: torch.Tensor) -> torch.Tensor:
+        logit = self.response_head(immune_embedding).squeeze(-1)
+        probability = torch.sigmoid(logit)
+        return probability
+
+    def forward(
+        self,
+        immune_embedding: torch.Tensor,
+        stochastic_passes: int = 20,
+        force_stochastic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.training or force_stochastic:
+            probabilities = []
+
+            for _ in range(stochastic_passes):
+                probability = self.forward_once(immune_embedding)
+                probabilities.append(probability)
+
+            probabilities = torch.stack(probabilities, dim=0)
+            mean_probability = probabilities.mean(dim=0)
+            uncertainty = probabilities.var(dim=0, unbiased=False)
+
+            return mean_probability, uncertainty, probabilities
+
+        probability = self.forward_once(immune_embedding)
+        uncertainty = torch.zeros_like(probability)
+        probabilities = probability.unsqueeze(0)
+
+        return probability, uncertainty, probabilities
+
+
+class MetabolicCausalPlanner(nn.Module):
+    """
+    Metabolic Causal Planner.
+
+    A compact model for supervised immunotherapy response prediction from
+    pre-treatment bulk RNA-seq profiles.
+
+    Pipeline:
+        RNA-seq vector
+            -> Counterfactual Metabolic Adjuster
+            -> Agent-driven Immune Response Mapper
+            -> Uncertainty-guided Response Predictor
+            -> Responder probability and uncertainty
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int = 128,
+        immune_embedding_dim: int = 64,
+        adjuster_hidden_dim: int = 256,
+        mapper_hidden_dims: Tuple[int, int] = (256, 128),
+        predictor_hidden_dim: int = 64,
+        dropout: float = 0.3,
+        stochastic_passes: int = 20,
+        uncertainty_weight: float = 0.1,
+        refinement_steps: int = 5,
+        refinement_step_size: float = 1e-2,
+    ) -> None:
+        super().__init__()
+
+        self.stochastic_passes = stochastic_passes
+        self.uncertainty_weight = uncertainty_weight
+        self.refinement_steps = refinement_steps
+        self.refinement_step_size = refinement_step_size
+
+        self.metabolic_adjuster = CounterfactualMetabolicAdjuster(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            hidden_dim=adjuster_hidden_dim,
+            dropout=dropout,
+        )
+
+        self.immune_mapper = AgentDrivenImmuneResponseMapper(
+            latent_dim=latent_dim,
+            embedding_dim=immune_embedding_dim,
+            hidden_dims=mapper_hidden_dims,
+            dropout=dropout,
+        )
+
+        self.response_predictor = UncertaintyGuidedResponsePredictor(
+            embedding_dim=immune_embedding_dim,
+            hidden_dim=predictor_hidden_dim,
+            dropout=dropout,
+        )
+
+    def encode(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z, delta_z, adjusted_z = self.metabolic_adjuster(x)
+        immune_embedding = self.immune_mapper(adjusted_z)
+
+        return {
+            "latent_state": z,
+            "counterfactual_adjustment": delta_z,
+            "adjusted_latent_state": adjusted_z,
+            "immune_embedding": immune_embedding,
+        }
+
+    def predict(
+        self,
+        immune_embedding: torch.Tensor,
+        force_stochastic: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        mean_probability, uncertainty, stochastic_probabilities = self.response_predictor(
+            immune_embedding=immune_embedding,
+            stochastic_passes=self.stochastic_passes,
+            force_stochastic=force_stochastic,
+        )
+
+        return {
+            "responder_probability": mean_probability,
+            "predictive_uncertainty": uncertainty,
+            "stochastic_probabilities": stochastic_probabilities,
+        }
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        force_stochastic: bool = False,
+        apply_refinement: bool = False,
+        labels: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        encoded_outputs = self.encode(x)
+        immune_embedding = encoded_outputs["immune_embedding"]
+
+        if apply_refinement and labels is not None:
+            immune_embedding = self.refine_representation(
+                immune_embedding=immune_embedding,
+                labels=labels,
+            )
+
+        prediction_outputs = self.predict(
+            immune_embedding=immune_embedding,
+            force_stochastic=force_stochastic,
+        )
+
+        outputs = {
+            **encoded_outputs,
+            **prediction_outputs,
+            "final_immune_embedding": immune_embedding,
+        }
+
+        return outputs
+
+    def compute_classification_loss(
+        self,
+        probabilities: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        labels = labels.float()
+        probabilities = torch.clamp(probabilities, min=1e-7, max=1.0 - 1e-7)
+
+        loss = F.binary_cross_entropy(probabilities, labels)
+        return loss
+
+    def compute_entropy(
+        self,
+        probabilities: torch.Tensor,
+    ) -> torch.Tensor:
+        probabilities = torch.clamp(probabilities, min=1e-7, max=1.0 - 1e-7)
+
+        entropy = -(
+            probabilities * torch.log(probabilities)
+            + (1.0 - probabilities) * torch.log(1.0 - probabilities)
+        )
+
+        return entropy
+
+    def compute_uncertainty_loss(
+        self,
+        probabilities: torch.Tensor,
+        uncertainty: torch.Tensor,
+    ) -> torch.Tensor:
+        entropy = self.compute_entropy(probabilities)
+        uncertainty_loss = torch.mean(uncertainty + entropy)
+
+        return uncertainty_loss
+
+    def compute_regularization_loss(
+        self,
+        latent_state: torch.Tensor,
+        counterfactual_adjustment: torch.Tensor,
+    ) -> torch.Tensor:
+        adjustment_sparsity = torch.mean(torch.abs(counterfactual_adjustment))
+        adjustment_smoothness = torch.mean(counterfactual_adjustment ** 2)
+
+        consistency_loss = torch.mean(
+            (latent_state.detach() - (latent_state + counterfactual_adjustment)) ** 2
+        )
+
+        regularization_loss = (
+            adjustment_sparsity
+            + adjustment_smoothness
+            + 0.1 * consistency_loss
+        )
+
+        return regularization_loss
+
+    def compute_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        regularization_weight: float = 1e-4,
+    ) -> Dict[str, torch.Tensor]:
+        responder_probability = outputs["responder_probability"]
+        predictive_uncertainty = outputs["predictive_uncertainty"]
+        latent_state = outputs["latent_state"]
+        counterfactual_adjustment = outputs["counterfactual_adjustment"]
+
+        classification_loss = self.compute_classification_loss(
+            probabilities=responder_probability,
+            labels=labels,
+        )
+
+        uncertainty_loss = self.compute_uncertainty_loss(
+            probabilities=responder_probability,
+            uncertainty=predictive_uncertainty,
+        )
+
+        regularization_loss = self.compute_regularization_loss(
+            latent_state=latent_state,
+            counterfactual_adjustment=counterfactual_adjustment,
+        )
+
+        total_loss = (
+            classification_loss
+            + self.uncertainty_weight * uncertainty_loss
+            + regularization_weight * regularization_loss
+        )
+
+        return {
+            "total_loss": total_loss,
+            "classification_loss": classification_loss,
+            "uncertainty_loss": uncertainty_loss,
+            "regularization_loss": regularization_loss,
+        }
+
+    def refine_representation(
+        self,
+        immune_embedding: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Refine the immune-response decision representation using gradient-based
+        feedback. This operation adjusts the representation, not the original
+        clinical treatment or input RNA-seq profile.
+        """
+
+        refined_embedding = immune_embedding.detach().clone()
+        refined_embedding.requires_grad_(True)
+
+        for _ in range(self.refinement_steps):
+            mean_probability, uncertainty, _ = self.response_predictor(
+                immune_embedding=refined_embedding,
+                stochastic_passes=self.stochastic_passes,
+                force_stochastic=True,
+            )
+
+            classification_loss = self.compute_classification_loss(
+                probabilities=mean_probability,
+                labels=labels,
+            )
+
+            uncertainty_loss = self.compute_uncertainty_loss(
+                probabilities=mean_probability,
+                uncertainty=uncertainty,
+            )
+
+            refinement_loss = (
+                classification_loss
+                + self.uncertainty_weight * uncertainty_loss
+            )
+
+            gradient = torch.autograd.grad(
+                refinement_loss,
+                refined_embedding,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+
+            refined_embedding = refined_embedding - self.refinement_step_size * gradient
+            refined_embedding = refined_embedding.detach()
+            refined_embedding.requires_grad_(True)
+
+        return refined_embedding.detach()
+
+
+def build_model(
+    input_dim: int,
+    latent_dim: int = 128,
+    immune_embedding_dim: int = 64,
+    dropout: float = 0.3,
+    stochastic_passes: int = 20,
+) -> MetabolicCausalPlanner:
+    """
+    Factory function for constructing the Metabolic Causal Planner.
+    """
+
+    model = MetabolicCausalPlanner(
+        input_dim=input_dim,
+        latent_dim=latent_dim,
+        immune_embedding_dim=immune_embedding_dim,
+        dropout=dropout,
+        stochastic_passes=stochastic_passes,
+    )
+
+    return model
+
+
+if __name__ == "__main__":
+    batch_size = 8
+    input_dim = 5000
+
+    x = torch.randn(batch_size, input_dim)
+    y = torch.randint(0, 2, size=(batch_size,)).float()
+
+    model = build_model(input_dim=input_dim)
+
+    outputs = model(
+        x,
+        force_stochastic=True,
+        apply_refinement=False,
+    )
+
+    losses = model.compute_loss(outputs, y)
+
+    print("Responder probability shape:", outputs["responder_probability"].shape)
+    print("Predictive uncertainty shape:", outputs["predictive_uncertainty"].shape)
+    print("Total loss:", losses["total_loss"].item())
